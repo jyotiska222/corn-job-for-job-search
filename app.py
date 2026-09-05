@@ -46,15 +46,15 @@ import re
 import smtplib
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from urllib.parse import quote_plus
 
 import google.generativeai as genai
+import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from crawl4ai import AsyncWebCrawler
 from flask import Flask, jsonify
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -209,8 +209,21 @@ def extract_jobs_from_content(url: str, content: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Crawling (Crawl4AI)
+# Crawling (Jina AI Reader — https://r.jina.ai/<url>)
 # ---------------------------------------------------------------------------
+# No browser, no OS deps: Jina renders the page server-side and hands back
+# clean Markdown. We still have to be careful on the free tier though:
+#   - It's a REQUESTS-PER-MINUTE limit (not a monthly quota), enforced per
+#     IP (unauthenticated) or per API key. Going over it gets you a 429.
+#   - The free key tier also caps CONCURRENT in-flight requests (docs cite 2
+#     concurrent on free), so hammering it in parallel causes 429s even if
+#     you're under the per-minute count.
+#   - Occasional slow/hanging pages are normal (2s typical, but complex/JS
+#     heavy pages can take much longer) — a stuck request must not be
+#     allowed to block the whole run, so every request gets a hard timeout.
+JINA_READER_BASE = "https://r.jina.ai/"
+
+
 def build_search_urls() -> list[str]:
     """Turn config.SEARCH_QUERIES into search-engine result page URLs."""
     urls = []
@@ -219,27 +232,119 @@ def build_search_urls() -> list[str]:
     return urls
 
 
-async def crawl_all(urls: list[str]) -> dict[str, str]:
-    """Crawl a list of URLs concurrently with Crawl4AI, return {url: markdown}."""
-    results: dict[str, str] = {}
-    semaphore = asyncio.Semaphore(config.CRAWL_CONCURRENCY)
+class _RateLimiter:
+    """
+    Simple async sliding-window rate limiter: allows at most `max_per_minute`
+    calls to acquire() within any rolling 60s window. Callers await
+    acquire() right before making the actual HTTP request.
+    """
 
-    async with AsyncWebCrawler(verbose=False) as crawler:
+    def __init__(self, max_per_minute: int):
+        self.max_per_minute = max(1, max_per_minute)
+        self._timestamps: list[float] = []
+        self._lock = asyncio.Lock()
 
-        async def crawl_one(u: str):
-            async with semaphore:
-                try:
-                    result = await asyncio.wait_for(
-                        crawler.arun(url=u), timeout=config.CRAWL_TIMEOUT_SECONDS
+    async def acquire(self):
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                # drop timestamps older than 60s
+                self._timestamps = [t for t in self._timestamps if now - t < 60]
+                if len(self._timestamps) < self.max_per_minute:
+                    self._timestamps.append(now)
+                    return
+                # need to wait until the oldest timestamp falls out of the window
+                sleep_for = 60 - (now - self._timestamps[0]) + 0.05
+            await asyncio.sleep(max(sleep_for, 0.05))
+
+
+async def _fetch_one(
+    client: httpx.AsyncClient,
+    url: str,
+    semaphore: asyncio.Semaphore,
+    rate_limiter: "_RateLimiter",
+) -> tuple[str, str | None]:
+    """
+    Fetch a single URL through the Jina Reader proxy. Returns (url, markdown)
+    on success, (url, None) on failure — never raises, so one bad URL can't
+    take down the whole batch.
+    """
+    headers = {"Accept": "text/plain"}
+    if config.JINA_API_KEY:
+        headers["Authorization"] = f"Bearer {config.JINA_API_KEY}"
+    # Ask Jina itself to cap how long it spends rendering server-side, on
+    # top of our own client-side timeout below — belt and suspenders.
+    headers["X-Timeout"] = str(config.JINA_TIMEOUT_SECONDS)
+
+    reader_url = f"{JINA_READER_BASE}{url}"
+
+    async with semaphore:
+        for attempt in range(1, config.JINA_MAX_RETRIES + 1):
+            await rate_limiter.acquire()
+            try:
+                resp = await asyncio.wait_for(
+                    client.get(reader_url, headers=headers),
+                    timeout=config.JINA_TIMEOUT_SECONDS + 5,  # hard ceiling incl. network overhead
+                )
+                if resp.status_code == 200:
+                    return url, resp.text
+                if resp.status_code == 429:
+                    # Rate-limited despite our limiter (e.g. shared IP, burst
+                    # from a previous run) — back off and retry.
+                    wait = config.JINA_RETRY_BACKOFF_SECONDS * attempt
+                    log.warning(
+                        "Jina 429 for %s (attempt %d/%d), backing off %.0fs",
+                        url, attempt, config.JINA_MAX_RETRIES, wait,
                     )
-                    if result and result.success:
-                        results[u] = result.markdown or result.cleaned_html or ""
-                    else:
-                        log.warning("Crawl failed for %s", u)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("Crawl error for %s: %s", u, exc)
+                    await asyncio.sleep(wait)
+                    continue
+                if 500 <= resp.status_code < 600:
+                    # Jina-side transient error — retry with light backoff.
+                    log.warning(
+                        "Jina %d for %s (attempt %d/%d)",
+                        resp.status_code, url, attempt, config.JINA_MAX_RETRIES,
+                    )
+                    await asyncio.sleep(config.JINA_RETRY_BACKOFF_SECONDS)
+                    continue
+                log.warning("Jina returned %d for %s, skipping", resp.status_code, url)
+                return url, None
+            except asyncio.TimeoutError:
+                log.warning(
+                    "Timeout fetching %s via Jina (attempt %d/%d)",
+                    url, attempt, config.JINA_MAX_RETRIES,
+                )
+                # no extra sleep needed — the timeout itself already cost time
+                continue
+            except httpx.HTTPError as exc:
+                log.warning(
+                    "HTTP error fetching %s via Jina (attempt %d/%d): %s",
+                    url, attempt, config.JINA_MAX_RETRIES, exc,
+                )
+                await asyncio.sleep(config.JINA_RETRY_BACKOFF_SECONDS)
+                continue
 
-        await asyncio.gather(*(crawl_one(u) for u in urls))
+        log.error("Giving up on %s after %d attempts", url, config.JINA_MAX_RETRIES)
+        return url, None
+
+
+async def crawl_all(urls: list[str]) -> dict[str, str]:
+    """Crawl a list of URLs concurrently via Jina Reader, return {url: markdown}."""
+    results: dict[str, str] = {}
+    semaphore = asyncio.Semaphore(config.JINA_MAX_CONCURRENCY)
+    rate_limiter = _RateLimiter(config.JINA_RATE_LIMIT_PER_MINUTE)
+
+    # A single shared client reuses connections; overall timeout is handled
+    # per-request above via asyncio.wait_for, so we don't need a tight
+    # client-level timeout here (it would fight with our own retry logic).
+    limits = httpx.Limits(max_connections=config.JINA_MAX_CONCURRENCY)
+    async with httpx.AsyncClient(limits=limits, timeout=None, follow_redirects=True) as client:
+        tasks = [_fetch_one(client, u, semaphore, rate_limiter) for u in urls]
+        for coro in asyncio.as_completed(tasks):
+            url, content = await coro
+            if content:
+                results[url] = content
+
+    log.info("Jina crawl finished: %d/%d URLs succeeded", len(results), len(urls))
     return results
 
 
@@ -445,7 +550,7 @@ def upsert_job(op: dict) -> bool:
     """Insert if new, update if existing. Returns True if newly inserted."""
     key = make_dedup_key(op)
     op["dedup_key"] = key
-    op["last_seen_at"] = datetime.utcnow()
+    op["last_seen_at"] = datetime.now(dt_timezone.utc)
     op["score"] = score_job(op)
 
     existing = jobs_col.find_one({"dedup_key": key})
@@ -453,7 +558,7 @@ def upsert_job(op: dict) -> bool:
         jobs_col.update_one({"dedup_key": key}, {"$set": op})
         return False
 
-    op["first_seen_at"] = datetime.utcnow()
+    op["first_seen_at"] = datetime.now(dt_timezone.utc)
     jobs_col.insert_one(op)
     return True
 
@@ -536,7 +641,7 @@ def send_email(html_body: str):
 # ---------------------------------------------------------------------------
 def run_pipeline():
     log.info("=== Pipeline run started ===")
-    run_doc = {"started_at": datetime.utcnow(), "status": "running"}
+    run_doc = {"started_at": datetime.now(dt_timezone.utc), "status": "running"}
     run_id = runs_col.insert_one(run_doc).inserted_id
 
     try:
@@ -580,7 +685,7 @@ def run_pipeline():
         if rejected:
             for r in rejected:
                 r["run_id"] = run_id
-                r["rejected_at"] = datetime.utcnow()
+                r["rejected_at"] = datetime.now(dt_timezone.utc)
             rejected_col.insert_many(rejected)
 
         open_jobs = get_open_jobs()
@@ -591,7 +696,7 @@ def run_pipeline():
             {"_id": run_id},
             {"$set": {
                 "status": "success",
-                "finished_at": datetime.utcnow(),
+                "finished_at": datetime.now(dt_timezone.utc),
                 "urls_crawled": len(pages),
                 "raw_openings": len(all_openings),
                 "eligible_openings": len(eligible),
@@ -604,7 +709,7 @@ def run_pipeline():
         log.exception("Pipeline run failed")
         runs_col.update_one(
             {"_id": run_id},
-            {"$set": {"status": "failed", "finished_at": datetime.utcnow(), "error": str(exc)}},
+            {"$set": {"status": "failed", "finished_at": datetime.now(dt_timezone.utc), "error": str(exc)}},
         )
 
 
@@ -614,7 +719,15 @@ def run_pipeline():
 scheduler = BackgroundScheduler(timezone=config.TIMEZONE)
 scheduler.add_job(
     run_pipeline,
-    trigger=CronTrigger(hour=config.SEND_HOUR, minute=config.SEND_MINUTE),
+    # IMPORTANT: CronTrigger resolves its own timezone independently of the
+    # scheduler's `timezone=` kwarg — without passing timezone explicitly here,
+    # it silently falls back to the host machine's local tz (UTC on Railway),
+    # so the job would fire 5h30m early/late relative to the intended IST time.
+    trigger=CronTrigger(
+        hour=config.SEND_HOUR,
+        minute=config.SEND_MINUTE,
+        timezone=config.TIMEZONE,
+    ),
     id="daily_job_alert",
     replace_existing=True,
 )
@@ -662,8 +775,12 @@ def list_rejected():
 
 if __name__ == "__main__":
     scheduler.start()
+    job = scheduler.get_job("daily_job_alert")
     log.info(
-        "Scheduler started. Daily run at %02d:%02d %s",
-        config.SEND_HOUR, config.SEND_MINUTE, config.TIMEZONE,
+        "Scheduler started. Daily run at %02d:%02d %s (next run: %s)",
+        config.SEND_HOUR,
+        config.SEND_MINUTE,
+        config.TIMEZONE,
+        job.next_run_time if job else "unknown",
     )
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

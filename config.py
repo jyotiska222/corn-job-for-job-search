@@ -11,6 +11,43 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _clean_env_value(raw: str) -> str:
+    """
+    python-dotenv only strips inline '# comment' suffixes when there's a
+    real value before the '#'. A line like `KEY=      # comment` (blank
+    value, comment only) is NOT stripped by dotenv and the comment text
+    itself becomes the value — silently corrupting the setting. Strip any
+    unquoted trailing '#...' comment ourselves as a defensive fallback.
+    """
+    if "#" in raw:
+        raw = raw.split("#", 1)[0]
+    return raw.strip()
+
+
+def _getenv_int(name: str, default: int) -> int:
+    """Like os.getenv but treats an unset OR blank/comment-only value as
+    'use the default' — a bare `KEY=` (or `KEY=   # comment`) left behind
+    after editing .env should not crash startup with int('')."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    cleaned = _clean_env_value(raw)
+    if not cleaned:
+        return default
+    return int(cleaned)
+
+
+def _getenv_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    cleaned = _clean_env_value(raw)
+    if not cleaned:
+        return default
+    return float(cleaned)
+
+
 # ---------------------------------------------------------------------------
 # Secrets / environment
 # ---------------------------------------------------------------------------
@@ -21,7 +58,7 @@ EMAIL_ID = os.getenv("EMAIL_ID")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 RECEIVER_EMAIL_ID = os.getenv("RECEIVER_EMAIL_ID")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_PORT = _getenv_int("SMTP_PORT", 587)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # required for extraction/classification
 
@@ -43,17 +80,17 @@ GEMINI_MODEL_FALLBACK_CHAIN = list(dict.fromkeys([m for m in _chain if m]))
 
 # Seconds to sleep between Gemini extraction calls, to stay under free-tier
 # RPM limits (gemini-3.1-flash-lite allows 15 RPM -> need >=4s between calls).
-GEMINI_CALL_DELAY_SECONDS = float(os.getenv("GEMINI_CALL_DELAY_SECONDS", "4.5"))
+GEMINI_CALL_DELAY_SECONDS = _getenv_float("GEMINI_CALL_DELAY_SECONDS", 4.5)
 # Retry attempts per model on rate-limit (429) errors, with linear backoff.
-GEMINI_RATE_LIMIT_RETRIES = int(os.getenv("GEMINI_RATE_LIMIT_RETRIES", "3"))
-GEMINI_RATE_LIMIT_BACKOFF_SECONDS = float(os.getenv("GEMINI_RATE_LIMIT_BACKOFF_SECONDS", "20"))
+GEMINI_RATE_LIMIT_RETRIES = _getenv_int("GEMINI_RATE_LIMIT_RETRIES", 3)
+GEMINI_RATE_LIMIT_BACKOFF_SECONDS = _getenv_float("GEMINI_RATE_LIMIT_BACKOFF_SECONDS", 20)
 
 # ---------------------------------------------------------------------------
 # Scheduling
 # ---------------------------------------------------------------------------
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
-SEND_HOUR = int(os.getenv("SEND_HOUR", "6"))
-SEND_MINUTE = int(os.getenv("SEND_MINUTE", "0"))
+SEND_HOUR = _getenv_int("SEND_HOUR", 6)
+SEND_MINUTE = _getenv_int("SEND_MINUTE", 0)
 
 # ---------------------------------------------------------------------------
 # Eligibility rules (hard filter)
@@ -252,13 +289,43 @@ SEARCH_QUERIES = [
 # Pipeline tuning
 # ---------------------------------------------------------------------------
 # NOTE: with a free-tier Gemini key (500 requests/day on gemini-3.1-flash-lite),
-# crawling ~55 seed URLs + ~28 search queries (each returning up to
-# MAX_PAGES_PER_QUERY pages) can easily produce more pages than your daily
-# quota can extract from. Keep these conservative, or split SEED_URLS /
-# SEARCH_QUERIES across multiple scheduled runs if you need broader coverage.
-CRAWL_CONCURRENCY = 5
-CRAWL_TIMEOUT_SECONDS = 45
+# crawling ~55 seed URLs + ~28 search queries can easily produce more pages
+# than your daily quota can extract from. Keep these conservative, or split
+# SEED_URLS / SEARCH_QUERIES across multiple scheduled runs if you need
+# broader coverage.
 MAX_PAGES_PER_QUERY = 3
+
+# ---------------------------------------------------------------------------
+# Jina AI Reader (crawler) — https://r.jina.ai/
+# ---------------------------------------------------------------------------
+# Optional: set JINA_API_KEY in .env for a higher free-tier rate limit
+# (100 RPM w/ key vs ~20 RPM unauthenticated, per IP). Get one free at
+# https://jina.ai/reader/ — no card required. Leave blank to run
+# unauthenticated (fine for this bot's ~80 URLs/day workload, just slower).
+JINA_API_KEY = _clean_env_value(os.getenv("JINA_API_KEY", ""))
+
+# Requests-per-minute ceiling our own rate limiter enforces client-side, so
+# we never even attempt to exceed Jina's limit (avoids wasted 429 round-trips).
+# Per Jina's published Reader API limits: 20 RPM without a key, 500 RPM with
+# a free API key. Kept slightly under the documented max to leave headroom
+# for other traffic sharing the same IP/key.
+JINA_RATE_LIMIT_PER_MINUTE = _getenv_int("JINA_RATE_LIMIT_PER_MINUTE", 450 if JINA_API_KEY else 18)
+
+# Max simultaneous in-flight requests. Even with 500 RPM, free-tier accounts
+# still get a low concurrent-request cap — going higher just produces 429s,
+# so default stays conservative. Bump this only if you confirm your key
+# allows more concurrency.
+JINA_MAX_CONCURRENCY = _getenv_int("JINA_MAX_CONCURRENCY", 3)
+
+# Per-request timeout (seconds). Jina typically responds in ~2s but complex/
+# JS-heavy pages can take much longer; this is passed to Jina itself via the
+# X-Timeout header AND enforced client-side so a single stuck page can never
+# stall the whole run.
+JINA_TIMEOUT_SECONDS = _getenv_int("JINA_TIMEOUT_SECONDS", 30)
+
+# Retry attempts per URL on 429 / 5xx / timeout, with linear backoff.
+JINA_MAX_RETRIES = _getenv_int("JINA_MAX_RETRIES", 3)
+JINA_RETRY_BACKOFF_SECONDS = _getenv_float("JINA_RETRY_BACKOFF_SECONDS", 8)
 
 # Mongo collection names
 COLLECTION_JOBS = "jobs"
