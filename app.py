@@ -44,6 +44,8 @@ import json
 import logging
 import re
 import smtplib
+import socket
+import ssl
 import threading
 import time
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -615,6 +617,30 @@ def build_email_html(jobs: list[dict]) -> str:
     """
 
 
+def _smtp_connect_ipv4(host: str, port: int, timeout: int = 20):
+    """
+    Open a raw socket to the SMTP host forcing IPv4, then wrap it for smtplib.
+
+    Railway (and several other PaaS hosts) resolve smtp.gmail.com to an
+    IPv6 address but don't route IPv6 traffic out of the container, which
+    surfaces as `OSError: [Errno 101] Network is unreachable` even though
+    the exact same code works fine locally (where IPv6 either works or
+    the resolver prefers IPv4). Forcing AF_INET here sidesteps that.
+    """
+    addrinfo = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    last_exc = None
+    for family, socktype, proto, _, sockaddr in addrinfo:
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_exc = exc
+            continue
+    raise last_exc or OSError(f"Could not resolve/connect to {host}:{port} over IPv4")
+
+
 def send_email(html_body: str):
     if not (config.EMAIL_ID and config.EMAIL_PASSWORD and config.RECEIVER_EMAIL_ID):
         log.error("Email credentials not fully configured — skipping send.")
@@ -626,14 +652,35 @@ def send_email(html_body: str):
     msg["To"] = config.RECEIVER_EMAIL_ID
     msg.attach(MIMEText(html_body, "html"))
 
-    try:
-        with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT) as server:
-            server.starttls()
-            server.login(config.EMAIL_ID, config.EMAIL_PASSWORD)
-            server.sendmail(config.EMAIL_ID, config.RECEIVER_EMAIL_ID, msg.as_string())
-        log.info("Email sent to %s", config.RECEIVER_EMAIL_ID)
-    except Exception as exc:  # noqa: BLE001
-        log.error("Failed to send email: %s", exc)
+    # Try STARTTLS on the configured port first, forcing IPv4. If that
+    # fails for network reasons, fall back to implicit SSL on 465 (also
+    # forced to IPv4) before giving up — covers hosts that block 587.
+    attempts = [(config.SMTP_HOST, config.SMTP_PORT, "starttls")]
+    if config.SMTP_PORT != 465:
+        attempts.append((config.SMTP_HOST, 465, "ssl"))
+
+    last_exc = None
+    for host, port, mode in attempts:
+        try:
+            raw_sock = _smtp_connect_ipv4(host, port)
+            if mode == "ssl":
+                context = ssl.create_default_context()
+                with smtplib.SMTP_SSL(host, port, sock=raw_sock, context=context, timeout=20) as server:
+                    server.login(config.EMAIL_ID, config.EMAIL_PASSWORD)
+                    server.sendmail(config.EMAIL_ID, config.RECEIVER_EMAIL_ID, msg.as_string())
+            else:
+                with smtplib.SMTP(host, port, sock=raw_sock, timeout=20) as server:
+                    server.starttls(context=ssl.create_default_context())
+                    server.login(config.EMAIL_ID, config.EMAIL_PASSWORD)
+                    server.sendmail(config.EMAIL_ID, config.RECEIVER_EMAIL_ID, msg.as_string())
+            log.info("Email sent to %s via %s:%s (%s)", config.RECEIVER_EMAIL_ID, host, port, mode)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            log.warning("SMTP attempt via %s:%s (%s) failed: %s", host, port, mode, exc)
+            continue
+
+    log.error("Failed to send email after all attempts: %s", last_exc)
 
 
 # ---------------------------------------------------------------------------
