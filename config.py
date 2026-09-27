@@ -60,6 +60,29 @@ RECEIVER_EMAIL_ID = os.getenv("RECEIVER_EMAIL_ID")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = _getenv_int("SMTP_PORT", 587)
 
+# ---------------------------------------------------------------------------
+# Resend (HTTPS email API) — https://resend.com
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS: Railway (and most PaaS hosts) block outbound SMTP traffic
+# (ports 25/465/587) on Free/Trial/Hobby plans to prevent spam abuse — see
+# https://docs.railway.com/networking/outbound-networking. That's a hard
+# network-level block, not something IPv4/IPv6 tricks or retries can work
+# around, which is why the exact same smtplib code works locally but always
+# times out / "Network is unreachable"s on Railway. Resend sends mail over a
+# normal HTTPS POST (port 443, never blocked), so it works on every plan.
+#
+# If RESEND_API_KEY is set, send_email() uses Resend first and only falls
+# back to raw SMTP if the Resend call itself fails (e.g. bad key). If it's
+# not set, behavior is unchanged and we go straight to SMTP like before.
+#
+# Setup: sign up free at https://resend.com (no card required, 3,000
+# emails/month / 100/day free tier), verify a sending domain (or use their
+# shared onboarding@resend.dev sender for quick testing), create an API key,
+# and set RESEND_API_KEY + RESEND_FROM_EMAIL in your .env / Railway
+# variables.
+RESEND_API_KEY = _clean_env_value(os.getenv("RESEND_API_KEY", ""))
+RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL") or EMAIL_ID
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # required for extraction/classification
 
 # Fallback chain of Gemini models, in order of preference. These must be the

@@ -692,9 +692,54 @@ def _send_via_ssl(host: str, port: int, force_ipv4: bool, msg) -> None:
             server.close()
 
 
+def _send_via_resend(html_body: str) -> None:
+    """
+    Send via Resend's HTTPS API (https://resend.com/docs/api-reference/emails/send-email).
+
+    This travels over normal HTTPS (port 443), which is never blocked, unlike
+    raw SMTP on Railway's Free/Trial/Hobby plans (see config.py comment on
+    RESEND_API_KEY for the full explanation). Raises on any failure so the
+    caller can fall back to SMTP.
+    """
+    resp = httpx.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {config.RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": config.RESEND_FROM_EMAIL,
+            "to": [config.RECEIVER_EMAIL_ID],
+            "subject": f"Off-Campus Fresher Job Alerts — {datetime.now().strftime('%d %b %Y')}",
+            "html": html_body,
+        },
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Resend API error {resp.status_code}: {resp.text[:500]}")
+
+
 def send_email(html_body: str):
-    if not (config.EMAIL_ID and config.EMAIL_PASSWORD and config.RECEIVER_EMAIL_ID):
-        log.error("Email credentials not fully configured — skipping send.")
+    if not config.RECEIVER_EMAIL_ID:
+        log.error("RECEIVER_EMAIL_ID not configured — skipping send.")
+        return
+
+    # --- Preferred path: Resend HTTPS API -----------------------------
+    # Works on every hosting plan (Railway included) since it's just an
+    # HTTPS POST, not a raw SMTP socket. Skipped entirely if no key is set.
+    if config.RESEND_API_KEY:
+        try:
+            _send_via_resend(html_body)
+            log.info("Email sent to %s via Resend API", config.RECEIVER_EMAIL_ID)
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Resend API send failed, falling back to SMTP: %s", exc)
+
+    # --- Fallback path: raw SMTP ----------------------------------------
+    # Kept for local development / Railway Pro plan (which does allow
+    # outbound SMTP) or any other host where ports 465/587 aren't blocked.
+    if not (config.EMAIL_ID and config.EMAIL_PASSWORD):
+        log.error("SMTP credentials not fully configured — cannot send fallback email.")
         return
 
     msg = MIMEMultipart("alternative")
@@ -703,11 +748,8 @@ def send_email(html_body: str):
     msg["To"] = config.RECEIVER_EMAIL_ID
     msg.attach(MIMEText(html_body, "html"))
 
-    # On Railway (and similar PaaS hosts), smtp.gmail.com can resolve to an
-    # IPv6 address that the container can't route to, causing
-    # "Network is unreachable" even though the identical code works fine
-    # locally. We detect that case and force an IPv4 connection; locally
-    # we use the normal smtplib path unchanged since it already works.
+    # On hosts that do allow outbound SMTP but still resolve smtp.gmail.com
+    # to an unreachable IPv6 address, force IPv4. Harmless elsewhere.
     force_ipv4 = os.getenv("SMTP_FORCE_IPV4", "").lower() in ("1", "true", "yes") or bool(
         os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID")
     )
@@ -740,7 +782,11 @@ def send_email(html_body: str):
                 )
                 continue
 
-    log.error("Failed to send email after all attempts: %s", last_exc)
+    log.error(
+        "Failed to send email after all attempts (Resend%s + SMTP): %s",
+        " not configured" if not config.RESEND_API_KEY else " also failed",
+        last_exc,
+    )
 
 
 # ---------------------------------------------------------------------------
